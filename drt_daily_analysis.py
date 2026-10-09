@@ -191,6 +191,9 @@ for _, route in routes.iterrows():
         current_bus_total_cost = (
             n_buses * BUS_DAILY_COST
         )
+        # 기존 버스 수입의 추정치: 일별 승차인원 x 가정 운임
+        # 실제 운임 정산액이 아니므로 추후 실수입 자료로 검증해야 한다.
+        current_bus_fare_revenue = riders * FARE
 
         if not service.empty:
             # 서비스에 필요한 최소 차량수: 실현가능성 판정용
@@ -206,7 +209,10 @@ for _, route in routes.iterrows():
 
             # α* 계산용:
             # 서비스 기준을 통과하는 모든 안 중 DRT 순비용이 가장 낮은 안.
-            # α* = DRT 순비용 / 현재 버스 총비용
+            # 기존 버스 운임수입을 반영한 이론적 손익분기 비율
+            # α* = (DRT 순비용 + 기존 버스 운임수입) / 현재 버스 총운행비
+            # 여기서는 서비스 기준만 적용한다. 실제 전환 여부는
+            # 아래 실현가능성(min_M <= n_buses)을 별도로 확인한다.
             best_cost = (
                 service
                 .sort_values(["daily_net_cost", "M"])
@@ -218,9 +224,8 @@ for _, route in routes.iterrows():
                 best_cost["daily_net_cost"]
             )
             alpha_star_day = (
-                drt_net_cost_for_alpha_star
-                / current_bus_total_cost
-            )
+                drt_net_cost_for_alpha_star + current_bus_fare_revenue
+            ) / current_bus_total_cost
 
             # 실현가능성 조건
             feasible_day = (
@@ -268,15 +273,15 @@ for _, route in routes.iterrows():
 
         for share in SCENARIO_SHARES:
             key = int(round(share * 100))
-            baseline_cost = (
-                current_bus_total_cost * share
-            )
+            # 전환 시 회피 가능한 버스 운행비
+            baseline_cost = current_bus_total_cost * share
+            # 기존 버스 운임수입 손실까지 반영한 비교용 순비용
+            baseline_net_cost = baseline_cost - current_bus_fare_revenue
+            scenario_values[f"bus_avoidable_cost_{key}"] = baseline_cost
+            scenario_values[f"bus_net_cost_{key}"] = baseline_net_cost
 
             if np.isfinite(best_feasible_drt_net_cost):
-                saving = (
-                    baseline_cost
-                    - best_feasible_drt_net_cost
-                )
+                saving = baseline_net_cost - best_feasible_drt_net_cost
                 scenario_values[f"drt_net_cost_{key}"] = (
                     best_feasible_drt_net_cost
                 )
@@ -297,6 +302,7 @@ for _, route in routes.iterrows():
             "lambda_per_min": lam,
             "current_bus_count": n_buses,
             "current_bus_total_cost": current_bus_total_cost,
+            "current_bus_fare_revenue": current_bus_fare_revenue,
             "operating_min": operating_min,
             "min_M_service": min_M,
             "mean_wait_at_min_M": wait,
@@ -364,6 +370,9 @@ for route_id, g in daily.groupby("route_id"):
         "median_current_bus_total_cost": (
             g["current_bus_total_cost"].median()
         ),
+        "median_current_bus_fare_revenue": (
+            g["current_bus_fare_revenue"].median()
+        ),
     }
 
     for share in SCENARIO_SHARES:
@@ -373,6 +382,10 @@ for route_id, g in daily.groupby("route_id"):
         )
         row[f"mean_daily_saving_{key}"] = (
             g[f"daily_saving_{key}"].mean()
+        )
+        # 보고서 표에서는 실현가능일의 일별 절감액 중앙값 사용
+        row[f"median_daily_saving_{key}"] = (
+            g[f"daily_saving_{key}"].median()
         )
 
     summary_rows.append(row)
@@ -681,7 +694,10 @@ def make_figures(daily, summary):
     )
 
     # ========================================================
-    # F2. 현행 운행비와 DRT 순비용 비교
+    # F2. 회피가능 버스 순비용과 DRT 순비용 비교
+    # 한 날짜에서 차액을 구한 뒤 중앙값을 내는 절감액과,
+    # 두 비용 각각의 중앙값 차이는 일반적으로 서로 다르다.
+    # F2 검수용 CSV에 두 가지 수치를 구분해 저장한다.
     # ========================================================
     cost_rows = []
 
@@ -690,44 +706,46 @@ def make_figures(daily, summary):
         if g.empty:
             continue
 
-        full_bus_cost = float(
-            g["current_bus_total_cost"].median()
-        )
-        current_bus_count = int(
-            g["current_bus_count"].iloc[0]
-        )
-        required_M = float(
-            g["min_M_service"].median()
-        )
+        current_bus_count = int(g["current_bus_count"].iloc[0])
+        required_M = float(g["min_M_service"].median())
+        feasible_days = int(g["feasible_day"].sum())
+        feasible = feasible_days > 0
+        gf = g[g["feasible_day"]].copy()
 
-        feasible = (
-            np.isfinite(required_M)
-            and required_M <= current_bus_count
-        )
-
-        drt_feasible_cost = (
-            float(g["best_feasible_drt_net_cost"].median())
-            if feasible
-            and g["best_feasible_drt_net_cost"].notna().any()
-            else np.nan
-        )
-
-        cost_rows.append({
+        row = {
             "route_id": rid,
-            "bus_full": full_bus_cost,
-            "drt": drt_feasible_cost,
+            "bus_full": float(g["current_bus_total_cost"].median()),
+            "bus_fare": float(g["current_bus_fare_revenue"].median()),
+            "drt": (
+                float(gf["best_feasible_drt_net_cost"].median())
+                if feasible else np.nan
+            ),
             "current_bus_count": current_bus_count,
             "required_M": required_M,
+            "feasible_days": feasible_days,
+            "total_days": len(g),
             "feasible": feasible,
-        })
+        }
+
+        for pct in (50, 70, 100):
+            # 두 점은 실현가능일에 한정한 각 비용의 중앙값
+            row[f"bus_net_{pct}"] = (
+                float(gf[f"bus_net_cost_{pct}"].median())
+                if feasible else np.nan
+            )
+            row[f"median_daily_saving_{pct}"] = (
+                float(gf[f"daily_saving_{pct}"].median())
+                if feasible else np.nan
+            )
+            row[f"economic_days_{pct}"] = int(g[f"economic_M_{pct}"].notna().sum())
+        cost_rows.append(row)
 
     cost_plot = pd.DataFrame(cost_rows)
 
-    # 검수용 표 저장
+    # 표 검수용: 회피가능 운행비, 운임수입, 순비용, 일별 절감액 중앙값을 별도 기록
     check_table = cost_plot.copy()
-    check_table["current_cost_50"] = check_table["bus_full"] * 0.50
-    check_table["current_cost_70"] = check_table["bus_full"] * 0.70
-    check_table["current_cost_100"] = check_table["bus_full"]
+    for pct in (50, 70, 100):
+        check_table[f"bus_avoidable_cost_{pct}"] = check_table["bus_full"] * (pct / 100)
     check_table.to_csv(
         OUT / "F2_cost_check.csv",
         index=False,
@@ -769,9 +787,8 @@ def make_figures(daily, summary):
             ):
                 continue
 
-            current_cost = (
-                row["bus_full"] * share / 10000.0
-            )
+            # 비교 대상: 회피가능 버스 운행비 - 기존 버스 운임수입
+            current_cost = row[f"bus_net_{pct}"] / 10000.0
             drt_cost = row["drt"] / 10000.0
 
             ax.plot(
@@ -864,7 +881,7 @@ def make_figures(daily, summary):
         labelpad=10,
     )
     ax.set_title(
-        "현행 운행비와 DRT 순비용 비교",
+        "회피가능 버스 순비용과 DRT 순비용 비교",
         loc="left",
         fontsize=F2_TITLE,
         fontweight="bold",
@@ -903,7 +920,7 @@ def make_figures(daily, summary):
             markerfacecolor=C["ink2"],
             markeredgecolor=C["ink2"],
             markersize=11,
-            label="현행 운행비",
+            label="회피가능 버스 순비용",
         ),
         Line2D(
             [0], [0],
